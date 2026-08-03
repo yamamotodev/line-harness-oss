@@ -1172,33 +1172,41 @@ booking.get('/api/booking/admin/requests', async (c) => {
   const accountId = await resolveAccountIdAdmin(c);
   if (!accountId) return c.json({ error: 'missing_account_id' }, 400);
   const status = c.req.query('status');
-  const sql = status === 'all'
-    ? `SELECT b.*,
+  const selectClause = `SELECT b.*,
               m.name AS menu_name,
               s.display_name AS staff_name,
               f.display_name AS friend_name
          FROM bookings b
          INNER JOIN menus m ON m.id = b.menu_id
          INNER JOIN staff s ON s.id = b.staff_id
-         LEFT JOIN friends f ON f.id = b.friend_id
+         LEFT JOIN friends f ON f.id = b.friend_id`;
+  // 同期ブロック（HPB連携で作られた占有枠）は通常タブから除外し、'sync' タブでのみ表示する
+  const excludeSyncBlocks = `(b.external_event_id IS NULL OR b.external_event_id NOT LIKE 'hpbsync:%')`;
+
+  let sql: string;
+  let stmt: D1PreparedStatement;
+  if (status === 'sync') {
+    sql = `${selectClause}
         WHERE b.line_account_id = ?
+          AND b.external_event_id LIKE 'hpbsync:%'
+          AND b.status = 'confirmed'
         ORDER BY b.starts_at ASC
-        LIMIT 200`
-    : `SELECT b.*,
-              m.name AS menu_name,
-              s.display_name AS staff_name,
-              f.display_name AS friend_name
-         FROM bookings b
-         INNER JOIN menus m ON m.id = b.menu_id
-         INNER JOIN staff s ON s.id = b.staff_id
-         LEFT JOIN friends f ON f.id = b.friend_id
-        WHERE b.line_account_id = ? AND b.status = ?
+        LIMIT 500`;
+    stmt = c.env.DB.prepare(sql).bind(accountId);
+  } else if (status === 'all') {
+    sql = `${selectClause}
+        WHERE b.line_account_id = ? AND ${excludeSyncBlocks}
         ORDER BY b.starts_at ASC
         LIMIT 200`;
-  const stmt = c.env.DB.prepare(sql);
-  const rows = await (status === 'all' || !status
-    ? (status === 'all' ? stmt.bind(accountId) : stmt.bind(accountId, 'requested'))
-    : stmt.bind(accountId, status)).all();
+    stmt = c.env.DB.prepare(sql).bind(accountId);
+  } else {
+    sql = `${selectClause}
+        WHERE b.line_account_id = ? AND ${excludeSyncBlocks} AND b.status = ?
+        ORDER BY b.starts_at ASC
+        LIMIT 200`;
+    stmt = c.env.DB.prepare(sql).bind(accountId, status || 'requested');
+  }
+  const rows = await stmt.all();
   return c.json({ requests: rows.results });
 });
 

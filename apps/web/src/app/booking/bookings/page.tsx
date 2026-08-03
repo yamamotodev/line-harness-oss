@@ -12,6 +12,7 @@ const STATUS_TABS: Array<{ key: string; label: string }> = [
   { key: 'rejected', label: '拒否' },
   { key: 'expired', label: '期限切れ' },
   { key: 'cancelled', label: 'キャンセル' },
+  { key: 'sync', label: '同期ブロック' },
   { key: 'all', label: '全件' },
 ]
 
