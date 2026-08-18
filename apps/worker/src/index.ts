@@ -106,6 +106,10 @@ export type Env = {
     ADMIN_ORIGIN?: string;          // Comma-separated admin web origin allowlist for credentialed CORS
     ADMIN_COOKIE_SAMESITE?: string; // Optional override: 'Strict' | 'Lax' | 'None'
     ADMIN_ALLOW_CROSS_SITE?: string; // 'true' opts into SameSite=None cross-site cookies
+    // Product display name shown to customers and operators. Read at RUNTIME
+    // here; the admin UI reads NEXT_PUBLIC_BRAND_NAME at BUILD time instead.
+    // Falls back to DEFAULT_BRAND_NAME when unset. See packages/shared/src/brand.ts.
+    BRAND_NAME?: string;
     X_HARNESS_URL?: string;  // Optional: X Harness API URL for account linking
     IG_HARNESS_URL?: string;  // Optional: IG Harness API URL for cross-platform linking
     IG_HARNESS_LINK_SECRET?: string;  // Shared secret for IG Harness link-line webhook

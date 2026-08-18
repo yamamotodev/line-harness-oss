@@ -78,6 +78,11 @@ jobs:
           ADMIN_ORIGIN: ${{ vars.ADMIN_ORIGIN }}
           ADMIN_ALLOW_CROSS_SITE: ${{ vars.ADMIN_ALLOW_CROSS_SITE }}
           WORKER_URL: ${{ vars.WORKER_URL }}
+          # Product display name, read by the Worker at RUNTIME. Its build-time
+          # counterpart is NEXT_PUBLIC_BRAND_NAME in deploy-cloudflare-admin.yml —
+          # set BOTH or the admin UI and customer-facing LINE messages disagree.
+          # Unset falls back to DEFAULT_BRAND_NAME in packages/shared.
+          BRAND_NAME: ${{ vars.BRAND_NAME }}
         run: |
           test -n "$D1_DATABASE_ID"
           cd apps/worker
@@ -97,6 +102,14 @@ jobs:
               | (if $w != "" then .vars.WORKER_URL = $w else . end)
             ' dist/line_harness/wrangler.json > "$tmp" && mv "$tmp" dist/line_harness/wrangler.json
             echo "Patched admin CORS vars: ADMIN_ORIGIN=$ADMIN_ORIGIN ADMIN_ALLOW_CROSS_SITE=${ADMIN_ALLOW_CROSS_SITE:-true}"
+          fi
+          # Inject the runtime brand name when set. Deliberately separate from the
+          # CORS block above so a fork can rebrand without configuring CORS.
+          if [ -n "$BRAND_NAME" ]; then
+            tmp="$(mktemp)"
+            jq --arg b "$BRAND_NAME" '.vars.BRAND_NAME = $b' \
+              dist/line_harness/wrangler.json > "$tmp" && mv "$tmp" dist/line_harness/wrangler.json
+            echo "Patched BRAND_NAME=$BRAND_NAME"
           fi
 
       - name: Deploy to Cloudflare Workers

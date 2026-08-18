@@ -1,15 +1,17 @@
 import { Hono } from 'hono';
+import { resolveBrandName } from '@line-crm/shared';
 import type { Env } from '../index.js';
 
 const setup = new Hono<Env>();
 
 setup.get('/setup', (c) => {
+  const brand = resolveBrandName(c.env.BRAND_NAME);
   return c.html(`<!DOCTYPE html>
 <html lang="ja">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>LINE Harness 導入ガイド</title>
+<title>${brand} 導入ガイド</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -224,7 +226,7 @@ setup.get('/setup', (c) => {
 </head>
 <body>
   <div class="header">
-    <h1>LINE Harness 導入ガイド</h1>
+    <h1>${brand} 導入ガイド</h1>
     <p>3ステップで LINE CRM を構築</p>
   </div>
 

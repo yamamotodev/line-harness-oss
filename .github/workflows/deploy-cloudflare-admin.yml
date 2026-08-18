@@ -36,6 +36,11 @@ jobs:
         env:
           NEXT_PUBLIC_API_URL: ${{ secrets.NEXT_PUBLIC_API_URL }}
           APP_BUILD_TIME: ${{ steps.build-meta.outputs.build_time }}
+          # Product display name. BUILD-TIME only: Next.js inlines this into the
+          # static export, so changing the variable requires re-running this
+          # workflow. Unset falls back to DEFAULT_BRAND_NAME in packages/shared.
+          # The Worker's runtime counterpart is BRAND_NAME in the worker workflow.
+          NEXT_PUBLIC_BRAND_NAME: ${{ vars.NEXT_PUBLIC_BRAND_NAME }}
 
       - name: Deploy to Cloudflare Pages
         env:

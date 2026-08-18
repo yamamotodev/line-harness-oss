@@ -40,6 +40,11 @@ crons = ["*/5 * * * *", "0 */6 * * *"]
 # 不活性になる (本番挙動を変えないための判断, 2026-07-07)。
 # ═══════════════════════════════════════════════════════════════
 [vars]
+# Product display name shown to customers and operators (runtime).
+# Overridden per-fork by the BRAND_NAME repo Variable via
+# .github/workflows/deploy-cloudflare-worker.yml. The admin UI has a
+# SEPARATE build-time variable, NEXT_PUBLIC_BRAND_NAME — set both.
+BRAND_NAME = "HARK"
 WORKER_NAME = "line-harness"
 ADMIN_PAGES_PROJECT = "line-harness-admin"
 LIFF_PAGES_PROJECT = "line-harness-liff"

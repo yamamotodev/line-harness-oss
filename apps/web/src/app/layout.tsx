@@ -1,10 +1,11 @@
 import type { Metadata } from 'next'
 import './globals.css'
 import AppShell from '@/components/app-shell'
+import { BRAND_NAME } from '@/lib/brand'
 
 export const metadata: Metadata = {
-  title: 'L Harness',
-  description: 'L Harness 管理画面',
+  title: BRAND_NAME,
+  description: `${BRAND_NAME} 管理画面`,
 }
 
 export default function RootLayout({
