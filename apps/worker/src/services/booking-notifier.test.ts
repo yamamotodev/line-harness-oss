@@ -20,7 +20,21 @@ describe('renderNotificationText', () => {
   test('承認', () => {
     const text = renderNotificationText('approved', ctx);
     expect(text).toContain('予約が確定しました');
-    expect(text).toContain('変更・キャンセルはお店に直接ご連絡ください');
+    // 「お店に連絡してください」ではなく、自分で操作できることを案内する
+    expect(text).toContain('予約確認');
+    expect(text).toContain('キャンセル');
+    expect(text).not.toContain('お店に直接ご連絡ください');
+  });
+  test('本人キャンセル', () => {
+    const text = renderNotificationText('cancelled_by_friend', ctx);
+    expect(text).toContain('ご予約をキャンセルしました');
+    expect(text).toContain('カット');
+    expect(text).toContain('2026-05-10 14:00');
+  });
+  test('お店都合のキャンセル', () => {
+    const text = renderNotificationText('cancelled_by_shop', ctx);
+    expect(text).toContain('キャンセルさせていただきました');
+    expect(text).toContain('カット');
   });
   test('拒否', () => {
     expect(renderNotificationText('rejected', ctx)).toContain('お取りできませんでした');

@@ -40,6 +40,14 @@ export interface BookingHistoryItem {
   menu_name: string;
   staff_name: string;
   profile_image_url: string | null;
+  /**
+   * キャンセルボタンを出すかどうか。判定は Worker 側で行う
+   * （端末の時計ズレや実装漏れで「押せるのに 409」になるのを防ぐため、
+   *  クライアントでは期限計算をしない）。
+   */
+  can_cancel?: boolean;
+  /** 開始の何時間前まで自分でキャンセルできるか。null は self キャンセル不可。 */
+  cancel_deadline_hours_before?: number | null;
 }
 
 function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
@@ -136,6 +144,8 @@ export const api = {
       { 'Idempotency-Key': idempotencyKey },
     ),
   me: () => get<{ upcoming: BookingHistoryItem[]; past: BookingHistoryItem[] }>('/api/liff/booking/me'),
+  cancelMyBooking: (bookingId: string) =>
+    post<{ ok: true; status: 'cancelled' }>(`/api/liff/booking/me/${bookingId}/cancel`, {}),
 
   // ===== Event booking =====
   getEvent: (id: string) => get<EventDetail>(`/api/liff/events/${id}`),

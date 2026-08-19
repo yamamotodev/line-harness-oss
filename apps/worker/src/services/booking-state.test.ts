@@ -11,6 +11,12 @@ describe('canTransition', () => {
   test('requested → expired via expire', () => {
     expect(canTransition('requested', 'expire')).toBe(true);
   });
+  // 返信待ちの間にお客様が取り下げる経路。無いと requested のまま残り、
+  // ジョブA が後から approve して HPB の枠を押さえてしまう。
+  test('requested → cancelled via cancel', () => {
+    expect(canTransition('requested', 'cancel')).toBe(true);
+    expect(nextStatus('requested', 'cancel')).toBe('cancelled');
+  });
   test('confirmed → cancelled via cancel', () => {
     expect(canTransition('confirmed', 'cancel')).toBe(true);
   });
@@ -46,9 +52,9 @@ describe('nextStatus', () => {
 });
 
 describe('transitionsFrom', () => {
-  test('requested allows approve / reject / expire', () => {
+  test('requested allows approve / reject / expire / cancel', () => {
     const actions: BookingAction[] = transitionsFrom('requested');
-    expect(actions.sort()).toEqual(['approve', 'expire', 'reject']);
+    expect(actions.sort()).toEqual(['approve', 'cancel', 'expire', 'reject']);
   });
   test('confirmed allows cancel / complete / no_show', () => {
     const actions = transitionsFrom('confirmed');

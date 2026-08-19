@@ -96,11 +96,19 @@ export interface AvailabilityByStaff {
 export interface AccountSettings {
   reminder_hours_before: number;
   min_lead_time_minutes: number;
+  /**
+   * お客様が LIFF から自分でキャンセルできる期限（開始の何時間前まで）。
+   * null は self キャンセル禁止＝お店に連絡してもらう運用。
+   * 実際の値は account_settings（key-value）の 'cancel_deadline_hours_before'。
+   * → services/booking-cancel.ts
+   */
+  cancel_deadline_hours_before: number | null;
 }
 
 export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   reminder_hours_before: 2,
   min_lead_time_minutes: 60,
+  cancel_deadline_hours_before: 24,
 };
 
 export const SLOT_GRANULARITY_MINUTES = 30;

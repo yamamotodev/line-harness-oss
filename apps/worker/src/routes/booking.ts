@@ -19,8 +19,17 @@ import {
   findIdempotencyResponse,
   saveIdempotencyResponse,
 } from '../services/booking-idempotency.js';
-import { sendBookingNotification } from '../services/booking-notifier.js';
+import {
+  sendBookingNotification,
+  type NotificationKind,
+} from '../services/booking-notifier.js';
 import { insertConfirmationReminders } from '../services/booking-confirm.js';
+import {
+  canCancelBooking,
+  cancelPendingBookingReminders,
+  checkCancelWindow,
+  getCancelDeadlineHours,
+} from '../services/booking-cancel.js';
 import { attachTagAndFireSideEffects } from '../services/friend-tag-attach.js';
 import {
   DEFAULT_ACCOUNT_SETTINGS,
@@ -173,11 +182,11 @@ async function resolveFriendId(
 async function notifyForBooking(
   db: D1Database,
   bookingId: string,
-  kind: 'requested' | 'approved' | 'rejected',
+  kind: NotificationKind,
 ): Promise<void> {
   const row = await db
     .prepare(
-      `SELECT b.starts_at,
+      `SELECT b.starts_at, b.external_event_id,
               m.name AS menu_name,
               s.display_name AS staff_name,
               la.channel_access_token,
@@ -192,12 +201,16 @@ async function notifyForBooking(
     .bind(bookingId)
     .first<{
       starts_at: string;
+      external_event_id: string | null;
       menu_name: string;
       staff_name: string;
       channel_access_token: string;
       line_user_id: string;
     }>();
   if (!row) return;
+  // HPB 同期ブロック（ジョブB が D1 に直接作る占有枠）はダミー friend に紐づいており、
+  // 実在しない line_user_id へ push すると必ず失敗する。人間の予約ではないので送らない。
+  if (row.external_event_id?.startsWith('hpbsync:')) return;
   await sendBookingNotification({
     channelAccessToken: row.channel_access_token,
     toLineUserId: row.line_user_id,
@@ -515,7 +528,91 @@ booking.get('/api/liff/booking/me', async (c) => {
     .bind(friendId, accountId, new Date().toISOString())
     .all();
 
-  return c.json({ upcoming: upcoming.results, past: past.results });
+  // キャンセルボタンを出すかどうかはサーバーが決める。クライアントに期限計算を
+  // 任せると、端末時計のズレや実装漏れで「押せるのに 409」が起きる。
+  const deadlineHours = await getCancelDeadlineHours(c.env.DB, accountId);
+  const now = new Date();
+  const withCancelFlag = (rows: unknown[]) =>
+    (rows as Array<Record<string, unknown>>).map((r) => ({
+      ...r,
+      cancel_deadline_hours_before: deadlineHours,
+      can_cancel: canCancelBooking({
+        status: String(r.status),
+        startsAt: String(r.starts_at),
+        deadlineHours,
+        now,
+      }),
+    }));
+
+  return c.json({
+    upcoming: withCancelFlag(upcoming.results ?? []),
+    past: withCancelFlag(past.results ?? []),
+  });
+});
+
+// お客様が自分でキャンセルする。events 側の
+// POST /api/liff/events/me/:bookingId/cancel と同じ形に揃えてある。
+//
+// 設計メモ:
+//   - 予約は friend_id + line_account_id でスコープする（他人の予約を触らせない）。
+//   - 状態は requested / confirmed のみ。cancelled は終端。
+//   - UPDATE は必ず条件付き（WHERE status = ?）。ジョブA の approve と競合したとき、
+//     両方が「成功した」と思い込んで通知が二重に飛ぶのを防ぐ。
+//     ＝ 2026-08-19 のリマインダー二重送信と同じ構造の事故を最初から潰しておく。
+booking.post('/api/liff/booking/me/:bookingId/cancel', async (c) => {
+  const accountId = await resolveAccountIdFromLiff(c);
+  if (!accountId) return c.json({ error: 'unknown_liff' }, 404);
+  const callerLineUserId = await verifyCallerLineUserId(c);
+  if (!callerLineUserId) return c.json({ error: 'unauthorized' }, 401);
+  const friendId = await resolveFriendId(c, callerLineUserId, accountId);
+  if (!friendId) return c.json({ error: 'friend_not_found' }, 404);
+
+  const id = c.req.param('bookingId');
+  const row = await c.env.DB
+    .prepare(
+      `SELECT id, status, starts_at FROM bookings
+        WHERE id = ? AND friend_id = ? AND line_account_id = ?`,
+    )
+    .bind(id, friendId, accountId)
+    .first<{ id: string; status: BookingStatus; starts_at: string }>();
+  if (!row) return c.json({ error: 'not_found' }, 404);
+  if (row.status !== 'requested' && row.status !== 'confirmed') {
+    return c.json({ error: 'invalid_state' }, 409);
+  }
+
+  const deadlineHours = await getCancelDeadlineHours(c.env.DB, accountId);
+  const check = checkCancelWindow({
+    startsAt: row.starts_at,
+    deadlineHours,
+    now: new Date(),
+  });
+  if (!check.ok) {
+    return c.json(
+      { error: check.reason },
+      check.reason === 'cancel_not_allowed' ? 403 : 409,
+    );
+  }
+
+  const updateResult = await c.env.DB
+    .prepare(
+      `UPDATE bookings SET status = 'cancelled', decided_at = ?,
+                            updated_at = strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')
+        WHERE id = ? AND status = ?`,
+    )
+    .bind(new Date().toISOString(), row.id, row.status)
+    .run();
+  if ((updateResult.meta?.changes ?? 0) === 0) {
+    // 直前にお店側（またはジョブA）が状態を変えた。副作用は走らせない。
+    return c.json({ error: 'concurrent_update' }, 409);
+  }
+
+  await cancelPendingBookingReminders(c.env.DB, row.id);
+  c.executionCtx.waitUntil(
+    notifyForBooking(c.env.DB, row.id, 'cancelled_by_friend').catch((err) =>
+      console.error('booking notify (cancelled_by_friend) failed:', err),
+    ),
+  );
+  return c.json({ ok: true, status: 'cancelled' });
 });
 
 // ================================================================
@@ -1256,12 +1353,16 @@ booking.patch('/api/booking/admin/requests/:id', async (c) => {
       ),
     );
   } else if (next === 'cancelled' || next === 'expired') {
-    await c.env.DB
-      .prepare(
-        `UPDATE booking_reminders SET status='cancelled' WHERE booking_id = ? AND status = 'pending'`,
-      )
-      .bind(id)
-      .run();
+    await cancelPendingBookingReminders(c.env.DB, id);
+    if (next === 'cancelled') {
+      // お店が取り消したのに、お客様に何も届かないのは事故。
+      // （HPB 同期ブロックは notifyForBooking 側で除外される）
+      c.executionCtx.waitUntil(
+        notifyForBooking(c.env.DB, id, 'cancelled_by_shop').catch((err) =>
+          console.error('booking notify (cancelled_by_shop) failed:', err),
+        ),
+      );
+    }
   }
 
   return c.json({ status: next });

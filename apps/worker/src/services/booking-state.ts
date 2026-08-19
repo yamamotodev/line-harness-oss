@@ -9,7 +9,10 @@ export type BookingAction =
   | 'no_show';
 
 const TRANSITIONS: Record<BookingStatus, Partial<Record<BookingAction, BookingStatus>>> = {
-  requested: { approve: 'confirmed', reject: 'rejected', expire: 'expired' },
+  // requested からの cancel は「お店の返信を待っている間に、お客様が取り下げる」経路。
+  // これが無いと、取り下げたい予約が requested のまま残り、ジョブA が後から approve して
+  // HPB の枠を押さえてしまう。cancelled は終端なので後戻りはできない。
+  requested: { approve: 'confirmed', reject: 'rejected', expire: 'expired', cancel: 'cancelled' },
   confirmed: { cancel: 'cancelled', no_show: 'no_show', complete: 'completed' },
   rejected: {},
   expired: {},
