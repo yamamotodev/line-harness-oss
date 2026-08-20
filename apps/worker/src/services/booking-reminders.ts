@@ -63,6 +63,24 @@ export async function processDueReminders(
   let failed = 0;
   for (const row of due.results) {
     const kind: NotificationKind = row.kind;
+    // 送信の前に行を claim する（条件付き UPDATE）。
+    // SELECT と UPDATE の間に別の cron 実行が割り込むと、同じ行を2つの実行が掴んで
+    // 2通送ってしまう（DB には UPDATE が1回分しか残らないので痕跡が出ない）。
+    // D1/SQLite はシングルライターなので、(id, retry_count) を条件にした UPDATE に
+    // 勝てるのは必ず片方だけ。負けた側は changes=0 で送信をスキップする。
+    // retry_count を claim epoch として使うため専用の列も migration も不要
+    // （event-booking-reminders.ts と同じ形）。
+    const claim = await db
+      .prepare(
+        `UPDATE booking_reminders
+            SET retry_count = retry_count + 1
+          WHERE id = ? AND retry_count = ? AND status IN ('pending','failed')`,
+      )
+      .bind(row.id, row.retry_count)
+      .run();
+    if ((claim.meta?.changes ?? 0) === 0) continue;
+    const claimedRetry = row.retry_count + 1;
+
     try {
       await params.sender({
         channelAccessToken: row.channel_access_token,
@@ -83,13 +101,13 @@ export async function processDueReminders(
         .run();
       sent++;
     } catch (e) {
-      const newRetry = row.retry_count + 1;
-      const newStatus = newRetry >= REMINDER_MAX_RETRY ? 'failed_permanent' : 'failed';
+      // retry_count は claim 時に加算済みなので、ここでは status と last_error だけ書く。
+      const newStatus = claimedRetry >= REMINDER_MAX_RETRY ? 'failed_permanent' : 'failed';
       await db
         .prepare(
-          `UPDATE booking_reminders SET status = ?, retry_count = ?, last_error = ? WHERE id = ?`,
+          `UPDATE booking_reminders SET status = ?, last_error = ? WHERE id = ?`,
         )
-        .bind(newStatus, newRetry, e instanceof Error ? e.message : String(e), row.id)
+        .bind(newStatus, e instanceof Error ? e.message : String(e), row.id)
         .run();
       failed++;
     }
