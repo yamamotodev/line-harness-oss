@@ -11,7 +11,7 @@
 // scheduled_at / decided_at / expires_at) are written from the Worker.
 
 import { Hono, type Context } from 'hono';
-import { getLineAccounts } from '@line-crm/db';
+import { getLineAccounts, resolveBusinessUnitId } from '@line-crm/db';
 import type { Env } from '../index.js';
 import { canTransition, nextStatus, type BookingAction } from '../services/booking-state.js';
 import { computeSlots, getAvailability } from '../services/availability.js';
@@ -388,6 +388,20 @@ booking.post('/api/liff/booking/requests', async (c) => {
   const minLeadAt = new Date(Date.now() + DEFAULT_ACCOUNT_SETTINGS.min_lead_time_minutes * 60_000);
   if (startsAt < minLeadAt) return c.json({ error: 'lead_time_violation' }, 422);
 
+
+  // 🔴 予約が属する営業単位(business_unit)を先に解決する。fail-closed。
+  //    決められない時は「それらしい1件」を選ばず、予約を作らない。
+  //    紐づけ漏れのまま別店舗として登録されると、その店の枠が塞がり本来の店の枠は
+  //    開いたまま残る(ダブルブッキングと架空の機会損失が同時に起きる)うえ、
+  //    値が入っているので NULL 監視をすり抜ける。NULL より誤った値の方が危険。
+  const buResolution = await resolveBusinessUnitId(c.env.DB, accountId);
+  if (!buResolution.ok) {
+    console.error(
+      `[booking] business_unit を解決できないため予約を受け付けませんでした reason=${buResolution.reason} account=${accountId}`,
+    );
+    return c.json({ error: 'booking_unavailable' }, 503);
+  }
+
   const bookingId = crypto.randomUUID();
   const nowIso = new Date().toISOString();
   // 競合チェックと INSERT を 1 ステートメントで原子化する。
@@ -398,8 +412,8 @@ booking.post('/api/liff/booking/requests', async (c) => {
       `INSERT INTO bookings
         (id, line_account_id, friend_id, staff_id, menu_id,
          starts_at, ends_at, block_ends_at, status,
-         customer_note, price_at_booking, requested_at)
-       SELECT ?,?,?,?,?,?,?,?,?,?,?,?
+         customer_note, price_at_booking, requested_at, business_unit_id)
+       SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?
         WHERE NOT EXISTS (
           SELECT 1 FROM bookings
            WHERE staff_id = ?
@@ -421,6 +435,7 @@ booking.post('/api/liff/booking/requests', async (c) => {
       body.customer_note ?? null,
       menuRow.price,
       nowIso,
+      buResolution.businessUnitId,
       // NOT EXISTS subquery params
       body.staff_id,
       blockEndsAt.toISOString(),
@@ -828,6 +843,20 @@ booking.post('/api/booking/admin/bookings', async (c) => {
     return c.json({ error: 'slot_not_available' }, 422);
   }
 
+
+  // 🔴 予約が属する営業単位(business_unit)を先に解決する。fail-closed。
+  //    決められない時は「それらしい1件」を選ばず、予約を作らない。
+  //    紐づけ漏れのまま別店舗として登録されると、その店の枠が塞がり本来の店の枠は
+  //    開いたまま残る(ダブルブッキングと架空の機会損失が同時に起きる)うえ、
+  //    値が入っているので NULL 監視をすり抜ける。NULL より誤った値の方が危険。
+  const buResolution = await resolveBusinessUnitId(c.env.DB, accountId);
+  if (!buResolution.ok) {
+    console.error(
+      `[booking] business_unit を解決できないため予約を受け付けませんでした reason=${buResolution.reason} account=${accountId}`,
+    );
+    return c.json({ error: 'booking_unavailable' }, 503);
+  }
+
   const bookingId = crypto.randomUUID();
   const nowIso = new Date().toISOString();
   const insertResult = await c.env.DB
@@ -835,8 +864,8 @@ booking.post('/api/booking/admin/bookings', async (c) => {
       `INSERT INTO bookings
         (id, line_account_id, friend_id, staff_id, menu_id,
          starts_at, ends_at, block_ends_at, status,
-         customer_note, price_at_booking, requested_at, decided_at)
-       SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?
+         customer_note, price_at_booking, requested_at, decided_at, business_unit_id)
+       SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?
         WHERE NOT EXISTS (
           SELECT 1 FROM bookings
            WHERE staff_id = ?
@@ -859,6 +888,7 @@ booking.post('/api/booking/admin/bookings', async (c) => {
       menuRow.price,
       nowIso,
       nowIso,
+      buResolution.businessUnitId,
       // NOT EXISTS subquery params
       body.staff_id,
       blockEndsAt.toISOString(),
