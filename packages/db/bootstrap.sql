@@ -181,7 +181,7 @@ CREATE TABLE bookings (
   external_event_id       TEXT,                 -- Phase 3 余地 (Google Calendar)
   external_calendar_id    TEXT,                 -- Phase 3 余地
   created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
-  updated_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
+  updated_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')), business_unit_id TEXT REFERENCES business_units(id),
   FOREIGN KEY (line_account_id) REFERENCES line_accounts(id),
   FOREIGN KEY (friend_id) REFERENCES friends(id),
   FOREIGN KEY (staff_id) REFERENCES staff(id),
@@ -228,6 +228,31 @@ CREATE TABLE "broadcasts" (
   failed_account_ids TEXT CHECK (failed_account_ids IS NULL OR json_valid(failed_account_ids))
 , dedup_progress TEXT, batch_lock_at TEXT, track_links INTEGER NOT NULL DEFAULT 1);
 
+CREATE TABLE business_unit_connectors (
+  business_unit_id  TEXT NOT NULL,
+  connector_id      TEXT NOT NULL,
+  line_account_id   TEXT NOT NULL,             -- テナント境界を複合FKで守るために持つ
+  external_shop_ref TEXT,
+  is_active         INTEGER NOT NULL DEFAULT 1,
+  created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
+  updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
+  PRIMARY KEY (business_unit_id, connector_id),
+  FOREIGN KEY (business_unit_id, line_account_id) REFERENCES business_units(id, line_account_id),
+  FOREIGN KEY (connector_id, line_account_id) REFERENCES connectors(id, line_account_id)
+);
+
+CREATE TABLE business_units (
+  id              TEXT PRIMARY KEY,
+  line_account_id TEXT NOT NULL,
+  name            TEXT NOT NULL,               -- 「覚王山店」など
+  sort_order      INTEGER NOT NULL DEFAULT 0,
+  is_active       INTEGER NOT NULL DEFAULT 1,
+  deleted_at      TEXT,
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
+  updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
+  FOREIGN KEY (line_account_id) REFERENCES line_accounts(id)
+);
+
 CREATE TABLE calendar_bookings (
   id             TEXT PRIMARY KEY,
   connection_id  TEXT NOT NULL REFERENCES google_calendar_connections (id) ON DELETE CASCADE,
@@ -252,6 +277,25 @@ CREATE TABLE chats (
   created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
   updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
 , line_account_id TEXT);
+
+CREATE TABLE connector_providers (
+  id         TEXT PRIMARY KEY,                 -- 'salonboard' | 'beautymerit' | 'rakuten_beauty'
+  label      TEXT NOT NULL,
+  is_active  INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
+);
+
+CREATE TABLE connectors (
+  id              TEXT PRIMARY KEY,
+  line_account_id TEXT NOT NULL,
+  provider        TEXT NOT NULL REFERENCES connector_providers(id),
+  display_name    TEXT NOT NULL,               -- 接続の呼び名(管理画面用)。店舗名は business_units 側
+  is_active       INTEGER NOT NULL DEFAULT 1,
+  deleted_at      TEXT,
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
+  updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
+  FOREIGN KEY (line_account_id) REFERENCES line_accounts(id)
+);
 
 CREATE TABLE conversion_events (
   id                   TEXT PRIMARY KEY,
@@ -728,6 +772,19 @@ CREATE TABLE staff (
   FOREIGN KEY (line_account_id) REFERENCES line_accounts(id)
 );
 
+CREATE TABLE staff_connectors (
+  staff_id           TEXT NOT NULL,
+  connector_id       TEXT NOT NULL,
+  line_account_id    TEXT NOT NULL,            -- テナント境界を複合FKで守るために持つ
+  external_staff_ref TEXT,
+  is_active          INTEGER NOT NULL DEFAULT 1,
+  created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
+  updated_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
+  PRIMARY KEY (staff_id, connector_id),
+  FOREIGN KEY (staff_id, line_account_id) REFERENCES staff(id, line_account_id),
+  FOREIGN KEY (connector_id, line_account_id) REFERENCES connectors(id, line_account_id)
+);
+
 CREATE TABLE staff_members (
   id         TEXT PRIMARY KEY,
   name       TEXT NOT NULL,
@@ -862,6 +919,8 @@ CREATE INDEX idx_automations_event ON automations (event_type);
 
 CREATE INDEX idx_bookings_account_status_starts ON bookings (line_account_id, status, starts_at);
 
+CREATE INDEX idx_bookings_business_unit ON bookings (business_unit_id, starts_at);
+
 CREATE INDEX idx_bookings_friend_starts ON bookings (friend_id, starts_at DESC);
 
 CREATE INDEX idx_bookings_staff_overlap ON bookings (staff_id, status, starts_at, block_ends_at);
@@ -872,6 +931,12 @@ CREATE INDEX idx_broadcast_insights_status ON broadcast_insights(status);
 
 CREATE INDEX idx_broadcasts_status ON broadcasts (status);
 
+CREATE INDEX idx_buc_connector ON business_unit_connectors (connector_id, is_active);
+
+CREATE INDEX idx_business_units_account ON business_units (line_account_id, is_active);
+
+CREATE UNIQUE INDEX idx_business_units_id_account ON business_units (id, line_account_id);
+
 CREATE INDEX idx_calendar_bookings_friend ON calendar_bookings (friend_id);
 
 CREATE INDEX idx_calendar_bookings_start ON calendar_bookings (start_at);
@@ -881,6 +946,10 @@ CREATE UNIQUE INDEX idx_chats_friend_unique ON chats (friend_id);
 CREATE INDEX idx_chats_operator ON chats (operator_id);
 
 CREATE INDEX idx_chats_status ON chats (status);
+
+CREATE INDEX idx_connectors_account ON connectors (line_account_id, is_active);
+
+CREATE UNIQUE INDEX idx_connectors_id_account ON connectors (id, line_account_id);
 
 CREATE INDEX idx_conversion_events_affiliate ON conversion_events (affiliate_code);
 
@@ -989,6 +1058,10 @@ CREATE INDEX idx_scenario_steps_scenario_id ON scenario_steps (scenario_id);
 CREATE INDEX idx_shifts_staff_date ON staff_shifts (staff_id, work_date);
 
 CREATE INDEX idx_staff_account_sort ON staff (line_account_id, sort_order);
+
+CREATE INDEX idx_staff_connectors_conn ON staff_connectors (connector_id, is_active);
+
+CREATE UNIQUE INDEX idx_staff_id_account ON staff (id, line_account_id);
 
 CREATE UNIQUE INDEX idx_staff_members_api_key ON staff_members(api_key);
 
