@@ -1,4 +1,5 @@
 import { jstNow } from './utils.js';
+import { defaultBusinessUnitStatement } from './business-units.js';
 // =============================================================================
 // LINE Accounts — Multi-Account Management
 // =============================================================================
@@ -51,7 +52,7 @@ export async function createLineAccount(
     .first<{ next: number }>();
   const displayOrder = orderRow?.next ?? 0;
 
-  await db
+  const insertAccount = db
     .prepare(
       `INSERT INTO line_accounts
          (id, channel_id, name, channel_access_token, channel_secret,
@@ -76,8 +77,15 @@ export async function createLineAccount(
       input.ogDefaultDescription ?? null,
       now,
       now,
-    )
-    .run();
+    );
+
+  // 🔴 テナントと既定 business_unit を「同じ batch」で作る。batch は1トランザクションなので、
+  //    「line_account はあるが business_unit が無い」という中間状態そのものを作らない。
+  //    これが無いと、テナント作成直後の予約が business_unit_id NULL になりうる
+  //    ＝正常な操作だけで不変条件を壊せてしまう。監視は壊れたことを検知するだけで、
+  //    壊れないようにするものではないので、ここで構造的に塞ぐ。
+  //    ⚠️ DBトリガーは使わない。additive-only 環境では後から DROP TRIGGER できず直せなくなる。
+  await db.batch([insertAccount, defaultBusinessUnitStatement(db, id, input.name)]);
 
   return (await getLineAccountById(db, id))!;
 }
