@@ -158,6 +158,10 @@ describe('POST /api/booking/admin/bookings', () => {
       ],
       ['FROM staff_shifts', { first: { start_time: '10:00', end_time: '19:00' } }],
       ['SELECT starts_at, block_ends_at FROM bookings', { all: { results: [] } }],
+      // 予約は必ず business_unit に属する(migration 050)。ルートは書き込みの手前で
+      // resolveBusinessUnitId を通し、決められなければ 503 で予約を作らない。
+      // 🔴 この行が無いと候補0件 = no_business_unit となり、全部 503 になる。
+      ['FROM business_units', { all: { results: [{ id: 'bu_acc1' }] } }],
       ['INSERT INTO bookings', { run: { meta: { changes: insertChanges } } }],
     ]);
   }
