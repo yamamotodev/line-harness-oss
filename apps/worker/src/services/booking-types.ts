@@ -96,11 +96,27 @@ export interface AvailabilityByStaff {
 export interface AccountSettings {
   reminder_hours_before: number;
   min_lead_time_minutes: number;
+  /**
+   * 何日先まで予約を受け付けるか（販売上限）。
+   *
+   * 🔑 14 なのは、LIFF の DateTimePicker が実際に見せている範囲(RANGE_DAYS = 14)と
+   *    一致させたから。ここを実物より広く書くと、「売っているのに同期していない
+   *    日付」が生まれる(＝bootstrap の完了判定が甘くなる)。
+   *
+   * 使う側:
+   *   - bootstrap の完了判定 … coverage_through >= 販売上限 を満たして初めて
+   *     scope を ready にする(migration 051 / 指示書 §5-3)。
+   *     販売上限 = min(staff_shifts の最終日, booking_horizon_days)
+   *   - gate は「要求された日付が coverage_through 以内か」を日付単位で見るので、
+   *     この定数には依存しない。
+   */
+  booking_horizon_days: number;
 }
 
 export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   reminder_hours_before: 2,
   min_lead_time_minutes: 60,
+  booking_horizon_days: 14,
 };
 
 export const SLOT_GRANULARITY_MINUTES = 30;
