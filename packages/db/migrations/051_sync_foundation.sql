@@ -6,11 +6,26 @@
 --      （同期ジョブが status='requested' しか見ないイベント駆動。管理画面は
 --        'confirmed' で直接作るのでイベントが発生しない）
 --   ② 新媒体・新店舗を足すと、台帳が空のまま同期対象になる（初期同期が無い）
---   ③ 止まっても誰も気づかない（実測でジョブBが9日14時間停止し未検知）
+--   ③ 同期が止まっている間も、worker は予約を受け付け続ける
+--
+-- ③について（ここを取り違えないこと）:
+--   同期が止まることは障害ではなく通常運転の一部。意図的な停止（headful の
+--   Chrome が5分ごとに作業画面を奪うので手で止める）・CAPTCHA対応・PC再起動・
+--   Chrome更新で、日常的に止まる。
+--   🔑 だから要件は「止まらないようにする」ではなく「止まった後に安全に
+--      復帰できる」。止まること自体を異常として設計しない。
+--   🔴 問題は、止まっている間も LIFF と管理画面が予約を受け付け続けること。
+--      worker 側には外部同期が止まったことを知る手段が1つも無い
+--      （poc2/out/mirror_state.json は poc2 のローカルファイルで、D1 にも
+--        worker にも届いていない）。
+--   🔴 そして再開時には、止まっていた期間ぶん台帳が現実とズレている。
+--
 -- ①②は同じ1つの修正で閉じる＝「イベントを拾う」から「状態を突き合わせる
 -- (reconciliation)」への変更。そのために「同期の単位(scope)」と「その単位が今
--- 販売してよい状態か」をDBに持つ。③は fresh_until を過ぎたら gate が自動的に
--- 販売を閉じることで、人の注意力に依存せず閉じる。
+-- 販売してよい状態か」をDBに持つ。
+-- ③の前半（止まっている間に売ってしまう）は fresh_until と gate で閉じる＝
+-- 同期の生存を worker 側から見える場所(D1)に置き、期限が切れたら販売を自動的に
+-- 閉じる。③の後半（再開時のズレ）は bootstrap / reconciliation で閉じる。
 --
 -- 【方針】additive-only (CONTRIBUTING.md §Migration Policy / scripts/check-migrations.ts)
 --   OK: CREATE TABLE / CREATE [UNIQUE] INDEX / CREATE VIEW / INSERT / UPDATE /
@@ -249,8 +264,10 @@ INSERT OR IGNORE INTO provider_capabilities (provider, capability) VALUES
   ('beautymerit', 'cancel_booking');
 
 -- 既存 connector を readiness='ready' にはしない。
--- 実測でジョブBが9日14時間止まっており、現在の台帳が外部と一致している保証が無い。
--- 「一致している」という未検証の事実をDBに書くことになるので、書かない。
+-- 同期は日常的に止まる(意図的な停止・CAPTCHA対応・PC再起動・Chrome更新)。直近も
+-- 2026-08-24 から9日以上止めてあり、その間に入った予約のぶん台帳は現実とズレている。
+-- つまり「今の台帳が外部と一致している」は誰も確かめていない。
+-- ready と書くことは、その未検証の事実をDBに書くことなので、書かない。
 -- 全 scope は readiness='blocked' から始め、自社の scope も1回 full bootstrap を
 -- 通して ready に上げる。他社販売前の今が、それができる最後のタイミング。
 --
