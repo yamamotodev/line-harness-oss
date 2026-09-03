@@ -181,7 +181,7 @@ CREATE TABLE bookings (
   external_event_id       TEXT,                 -- Phase 3 余地 (Google Calendar)
   external_calendar_id    TEXT,                 -- Phase 3 余地
   created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
-  updated_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')), business_unit_id TEXT REFERENCES business_units(id),
+  updated_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')), business_unit_id TEXT REFERENCES business_units(id), resource_id TEXT REFERENCES resources(id), connector_id TEXT REFERENCES connectors(id), external_ref TEXT,
   FOREIGN KEY (line_account_id) REFERENCES line_accounts(id),
   FOREIGN KEY (friend_id) REFERENCES friends(id),
   FOREIGN KEY (staff_id) REFERENCES staff(id),
@@ -283,7 +283,7 @@ CREATE TABLE connector_providers (
   label      TEXT NOT NULL,
   is_active  INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
-);
+, kind TEXT NOT NULL DEFAULT 'booking_site');
 
 CREATE TABLE connectors (
   id              TEXT PRIMARY KEY,
@@ -293,7 +293,7 @@ CREATE TABLE connectors (
   is_active       INTEGER NOT NULL DEFAULT 1,
   deleted_at      TEXT,
   created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
-  updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
+  updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')), readonly_ack INTEGER NOT NULL DEFAULT 0,
   FOREIGN KEY (line_account_id) REFERENCES line_accounts(id)
 );
 
@@ -529,6 +529,14 @@ CREATE TABLE incoming_webhooks (
   updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
 );
 
+CREATE TABLE job_leases (
+  job_name       TEXT PRIMARY KEY,
+  lease_owner    TEXT NOT NULL,
+  lease_until    TEXT NOT NULL,
+  fencing_token  INTEGER NOT NULL DEFAULT 0,
+  updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
+);
+
 CREATE TABLE line_accounts (
   id                     TEXT PRIMARY KEY,
   channel_id             TEXT NOT NULL UNIQUE,
@@ -551,6 +559,16 @@ CREATE TABLE link_clicks (
   tracked_link_id TEXT NOT NULL REFERENCES tracked_links (id) ON DELETE CASCADE,
   friend_id TEXT REFERENCES friends (id) ON DELETE SET NULL,
   clicked_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE menu_resources (
+  menu_id         TEXT NOT NULL,
+  resource_id     TEXT NOT NULL,
+  line_account_id TEXT NOT NULL,                  -- テナント境界を複合FKで守るために持つ
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
+  PRIMARY KEY (menu_id, resource_id),
+  FOREIGN KEY (menu_id,     line_account_id) REFERENCES menus(id, line_account_id),
+  FOREIGN KEY (resource_id, line_account_id) REFERENCES resources(id, line_account_id)
 );
 
 CREATE TABLE menus (
@@ -649,6 +667,12 @@ CREATE TABLE pool_accounts (
   UNIQUE(pool_id, line_account_id)
 );
 
+CREATE TABLE provider_capabilities (
+  provider   TEXT NOT NULL REFERENCES connector_providers(id),
+  capability TEXT NOT NULL,
+  PRIMARY KEY (provider, capability)
+);
+
 CREATE TABLE ref_tracking (
   id              TEXT PRIMARY KEY,
   ref_code        TEXT NOT NULL,
@@ -675,6 +699,18 @@ CREATE TABLE reminders (
   created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
   updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
 , line_account_id TEXT);
+
+CREATE TABLE resources (
+  id               TEXT PRIMARY KEY,
+  line_account_id  TEXT NOT NULL,
+  business_unit_id TEXT NOT NULL,
+  name             TEXT NOT NULL,                 -- 席1 / ベッドA / 個室 / 機器名
+  kind             TEXT NOT NULL DEFAULT 'seat',  -- seat / bed / room / machine
+  is_active        INTEGER NOT NULL DEFAULT 1,
+  created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
+  FOREIGN KEY (line_account_id) REFERENCES line_accounts(id),
+  FOREIGN KEY (business_unit_id, line_account_id) REFERENCES business_units(id, line_account_id)
+);
 
 CREATE TABLE rich_menu_areas (
   id              TEXT PRIMARY KEY,
@@ -830,6 +866,48 @@ CREATE TABLE stripe_events (
   processed_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours'))
 );
 
+CREATE TABLE sync_runs (
+  id               TEXT PRIMARY KEY,
+  scope_id         TEXT NOT NULL REFERENCES sync_scopes(id),
+  generation       INTEGER NOT NULL,
+  run_type         TEXT NOT NULL,   -- bootstrap / refresh / manual
+  status           TEXT NOT NULL,   -- running / succeeded / failed
+  started_at       TEXT NOT NULL,
+  finished_at      TEXT,
+  coverage_from    TEXT,
+  coverage_through TEXT,
+  error_code       TEXT,
+  error_message    TEXT
+);
+
+CREATE TABLE sync_scopes (
+  id                      TEXT PRIMARY KEY,
+  line_account_id         TEXT NOT NULL,
+  business_unit_id        TEXT NOT NULL,
+  connector_id            TEXT NOT NULL,
+  staff_id                TEXT,
+  resource_id             TEXT,
+  -- 状態。既定は blocked = 何も分かっていないうちは売らない(fail-closed)
+  readiness               TEXT NOT NULL DEFAULT 'blocked',   -- ready / blocked
+  phase                   TEXT NOT NULL DEFAULT 'idle',      -- idle / bootstrap / refresh
+  -- 世代。部分的にしか作れていない台帳を公開しないための二重化。
+  -- building を作り切ってから published に切り替える。
+  published_generation    INTEGER,
+  building_generation     INTEGER,
+  coverage_through        TEXT,      -- どこまでの日付を同期できたか(販売上限と比較する)
+  fresh_until             TEXT,      -- これを過ぎたら販売を閉じる(dead-man switch)
+  last_successful_sync_at TEXT,      -- 「実行した」ではなく「成功した」時刻。失敗では進めない
+  last_manual_run_at      TEXT,      -- 手動実行。自動と混ぜて表示しない
+  sync_started_at         TEXT,      -- phase のままスタックした時の復帰判定に使う
+  last_error_at           TEXT,
+  last_error_code         TEXT,
+  created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours')),
+  FOREIGN KEY (business_unit_id, line_account_id) REFERENCES business_units(id, line_account_id),
+  FOREIGN KEY (connector_id,     line_account_id) REFERENCES connectors(id, line_account_id),
+  FOREIGN KEY (staff_id,         line_account_id) REFERENCES staff(id, line_account_id),
+  FOREIGN KEY (resource_id,      line_account_id) REFERENCES resources(id, line_account_id)
+);
+
 CREATE TABLE tags (
   id         TEXT PRIMARY KEY,
   name       TEXT UNIQUE NOT NULL,
@@ -921,7 +999,13 @@ CREATE INDEX idx_bookings_account_status_starts ON bookings (line_account_id, st
 
 CREATE INDEX idx_bookings_business_unit ON bookings (business_unit_id, starts_at);
 
+CREATE INDEX idx_bookings_connector ON bookings (connector_id, starts_at);
+
+CREATE INDEX idx_bookings_external_ref ON bookings (connector_id, external_ref);
+
 CREATE INDEX idx_bookings_friend_starts ON bookings (friend_id, starts_at DESC);
+
+CREATE INDEX idx_bookings_resource ON bookings (resource_id, starts_at);
 
 CREATE INDEX idx_bookings_staff_overlap ON bookings (staff_id, status, starts_at, block_ends_at);
 
@@ -1019,7 +1103,11 @@ CREATE INDEX idx_link_clicks_friend ON link_clicks (friend_id);
 
 CREATE INDEX idx_link_clicks_link ON link_clicks (tracked_link_id);
 
+CREATE INDEX idx_menu_resources_resource ON menu_resources (resource_id);
+
 CREATE INDEX idx_menus_account_sort ON menus (line_account_id, sort_order);
+
+CREATE UNIQUE INDEX idx_menus_id_account ON menus (id, line_account_id);
 
 CREATE INDEX idx_messages_log_broadcast_id ON messages_log(broadcast_id);
 
@@ -1047,6 +1135,10 @@ CREATE INDEX idx_reminder_steps_reminder ON reminder_steps (reminder_id);
 
 CREATE INDEX idx_reminders_status_scheduled ON booking_reminders (status, scheduled_at);
 
+CREATE INDEX idx_resources_bu ON resources (business_unit_id, is_active);
+
+CREATE UNIQUE INDEX idx_resources_id_account ON resources (id, line_account_id);
+
 CREATE INDEX idx_rich_menu_areas_page     ON rich_menu_areas(page_id);
 
 CREATE INDEX idx_rich_menu_groups_account ON rich_menu_groups(account_id, status);
@@ -1071,6 +1163,12 @@ CREATE INDEX idx_stripe_events_friend ON stripe_events (friend_id);
 
 CREATE INDEX idx_stripe_events_type ON stripe_events (event_type);
 
+CREATE INDEX idx_sync_runs_scope ON sync_runs (scope_id, started_at DESC);
+
+CREATE UNIQUE INDEX idx_sync_scopes_uniq
+  ON sync_scopes (line_account_id, business_unit_id, connector_id,
+                  COALESCE(staff_id, '-'), COALESCE(resource_id, '-'));
+
 CREATE INDEX idx_templates_category ON templates (category);
 
 CREATE UNIQUE INDEX idx_tracked_links_short_code
@@ -1083,3 +1181,13 @@ CREATE INDEX idx_users_email ON users (email);
 CREATE INDEX idx_users_external_id ON users (external_id);
 
 CREATE INDEX idx_users_phone ON users (phone);
+
+CREATE VIEW bookable_scopes_v1 AS
+SELECT s.*
+  FROM sync_scopes s
+  JOIN connectors c ON c.id = s.connector_id
+ WHERE c.is_active = 1
+   AND c.deleted_at IS NULL
+   AND s.readiness = 'ready'
+   AND s.fresh_until IS NOT NULL
+   AND s.fresh_until > strftime('%Y-%m-%dT%H:%M:%f', 'now', '+9 hours');

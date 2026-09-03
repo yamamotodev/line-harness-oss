@@ -33,7 +33,9 @@ function setupDbBefore050(): Database.Database {
   for (const file of readdirSync(MIGRATIONS_DIR)
     .filter((f) => f.endsWith('.sql'))
     .sort()) {
-    if (file === MIGRATION_050) continue;
+    // 050 以降は適用しない。「050 を除く」だと、051 以降の後続マイグレーション
+    // (050 が作ったテーブルに依存する) までこの DB に流れ込んで壊れる。
+    if (file >= MIGRATION_050) continue;
     execSafe(db, readFileSync(join(MIGRATIONS_DIR, file), 'utf8'));
   }
   return db;
