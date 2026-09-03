@@ -11,7 +11,7 @@
 // scheduled_at / decided_at / expires_at) are written from the Worker.
 
 import { Hono, type Context } from 'hono';
-import { getLineAccounts, resolveBusinessUnitId } from '@line-crm/db';
+import { getLineAccounts, getReservability } from '@line-crm/db';
 import type { Env } from '../index.js';
 import { canTransition, nextStatus, type BookingAction } from '../services/booking-state.js';
 import { computeSlots, getAvailability } from '../services/availability.js';
@@ -136,6 +136,75 @@ async function verifyCallerLineUserId(c: Context<Env>): Promise<string | null> {
 
 async function resolveAccountIdAdmin(c: Context<Env>): Promise<string | null> {
   return c.req.query('account_id') ?? null;
+}
+
+// ----------------------------------------------------------------
+// 予約可否の関門(gate)を空き表示に適用する。
+//
+// 🔴 表示側を閉じないと、人が画面を見て手で予約を入れる。確定側だけでは足りない。
+// 🔴 スタッフ単位で見る。scope の粒度がスタッフ単位(staff_connectors の PK が
+//    (staff_id, connector_id))なので、店舗全体で1回だけ判定すると、
+//    「スタッフAだけ同期が止まっている」時に全員分を閉じることになる。
+// 🔑 空欄にしない。閉じたスタッフは slots を空にしたうえで、blocked_staff に
+//    理由と最終同期時刻を載せる。何も言わずに空にすると「空きが無い」と読まれる。
+//    last_successful_sync_at(自動)と last_manual_run_at(手動)は別々に返す。
+async function applyGateToAvailability(
+  db: D1Database,
+  accountId: string,
+  from: string,
+  result: {
+    by_staff: {
+      staff_id: string;
+      display_name: string;
+      slots: { date: string; start: string; end: string }[];
+    }[];
+  },
+) {
+  const blockedStaff: {
+    staff_id: string;
+    reason: string;
+    blocked_from: string | null;
+    last_successful_sync_at: string | null;
+    last_manual_run_at: string | null;
+  }[] = [];
+  const byStaff: typeof result.by_staff = [];
+  let coverageThrough: string | null = null;
+
+  for (const s of result.by_staff) {
+    const gate = await getReservability(db, {
+      lineAccountId: accountId,
+      date: from,
+      staffId: s.staff_id,
+    });
+    if (!gate.reservable) {
+      blockedStaff.push({
+        staff_id: s.staff_id,
+        reason: gate.reason,
+        blocked_from: gate.blockedFrom,
+        last_successful_sync_at: gate.lastSuccessfulSyncAt,
+        last_manual_run_at: gate.lastManualRunAt,
+      });
+      byStaff.push({ ...s, slots: [] });
+      continue;
+    }
+    // 同期が届いていない日付のスロットは出さない。
+    const through = gate.coverageThrough;
+    const slots = through ? s.slots.filter((slot) => slot.date <= through) : s.slots;
+    if (through && (coverageThrough === null || through < coverageThrough)) {
+      coverageThrough = through;
+    }
+    byStaff.push({ ...s, slots });
+  }
+
+  return {
+    by_staff: byStaff,
+    gate: {
+      // 1人でも予約可能なら true。全員閉じている時だけ false。
+      reservable: blockedStaff.length < result.by_staff.length || result.by_staff.length === 0,
+      coverage_through: coverageThrough,
+      blocked_staff: blockedStaff,
+    },
+  };
 }
 
 // staff が指定 account に属することを保証する。属していなければ null を返す。
@@ -277,7 +346,7 @@ booking.get('/api/liff/booking/availability', async (c) => {
     now: new Date(),
     minLeadTimeMinutes: DEFAULT_ACCOUNT_SETTINGS.min_lead_time_minutes,
   });
-  return c.json(result);
+  return c.json(await applyGateToAvailability(c.env.DB, accountId, from, result));
 });
 
 booking.post('/api/liff/booking/requests', async (c) => {
@@ -389,17 +458,22 @@ booking.post('/api/liff/booking/requests', async (c) => {
   if (startsAt < minLeadAt) return c.json({ error: 'lead_time_violation' }, 422);
 
 
-  // 🔴 予約が属する営業単位(business_unit)を先に解決する。fail-closed。
-  //    決められない時は「それらしい1件」を選ばず、予約を作らない。
+  // 🔴 予約可否の関門(gate)。営業単位の解決もこの中に入っている。
+  //    決められない時・外部同期が信用できない時は、予約を作らない(fail-closed)。
   //    紐づけ漏れのまま別店舗として登録されると、その店の枠が塞がり本来の店の枠は
   //    開いたまま残る(ダブルブッキングと架空の機会損失が同時に起きる)うえ、
   //    値が入っているので NULL 監視をすり抜ける。NULL より誤った値の方が危険。
-  const buResolution = await resolveBusinessUnitId(c.env.DB, accountId);
-  if (!buResolution.ok) {
+  //    外部同期が止まっている間に売ってしまうのも同じ構造の事故なので、同じ関門で見る。
+  const gate = await getReservability(c.env.DB, {
+    lineAccountId: accountId,
+    date: startJstDate,
+    staffId: body.staff_id,
+  });
+  if (!gate.reservable) {
     console.error(
-      `[booking] business_unit を解決できないため予約を受け付けませんでした reason=${buResolution.reason} account=${accountId}`,
+      `[booking] 予約を受け付けませんでした reason=${gate.reason} account=${accountId} staff=${body.staff_id}`,
     );
-    return c.json({ error: 'booking_unavailable' }, 503);
+    return c.json({ error: 'booking_unavailable', reason: gate.reason }, 503);
   }
 
   const bookingId = crypto.randomUUID();
@@ -435,7 +509,7 @@ booking.post('/api/liff/booking/requests', async (c) => {
       body.customer_note ?? null,
       menuRow.price,
       nowIso,
-      buResolution.businessUnitId,
+      gate.businessUnitId,
       // NOT EXISTS subquery params
       body.staff_id,
       blockEndsAt.toISOString(),
@@ -750,7 +824,7 @@ booking.get('/api/booking/admin/availability', async (c) => {
     now: new Date(),
     minLeadTimeMinutes: 0,
   });
-  return c.json(result);
+  return c.json(await applyGateToAvailability(c.env.DB, accountId, from, result));
 });
 
 // Proxy booking: the operator creates a CONFIRMED booking on behalf of a
@@ -844,17 +918,22 @@ booking.post('/api/booking/admin/bookings', async (c) => {
   }
 
 
-  // 🔴 予約が属する営業単位(business_unit)を先に解決する。fail-closed。
-  //    決められない時は「それらしい1件」を選ばず、予約を作らない。
+  // 🔴 予約可否の関門(gate)。営業単位の解決もこの中に入っている。
+  //    決められない時・外部同期が信用できない時は、予約を作らない(fail-closed)。
   //    紐づけ漏れのまま別店舗として登録されると、その店の枠が塞がり本来の店の枠は
   //    開いたまま残る(ダブルブッキングと架空の機会損失が同時に起きる)うえ、
   //    値が入っているので NULL 監視をすり抜ける。NULL より誤った値の方が危険。
-  const buResolution = await resolveBusinessUnitId(c.env.DB, accountId);
-  if (!buResolution.ok) {
+  //    外部同期が止まっている間に売ってしまうのも同じ構造の事故なので、同じ関門で見る。
+  const gate = await getReservability(c.env.DB, {
+    lineAccountId: accountId,
+    date: startJstDate,
+    staffId: body.staff_id,
+  });
+  if (!gate.reservable) {
     console.error(
-      `[booking] business_unit を解決できないため予約を受け付けませんでした reason=${buResolution.reason} account=${accountId}`,
+      `[booking] 予約を受け付けませんでした reason=${gate.reason} account=${accountId} staff=${body.staff_id}`,
     );
-    return c.json({ error: 'booking_unavailable' }, 503);
+    return c.json({ error: 'booking_unavailable', reason: gate.reason }, 503);
   }
 
   const bookingId = crypto.randomUUID();
@@ -888,7 +967,7 @@ booking.post('/api/booking/admin/bookings', async (c) => {
       menuRow.price,
       nowIso,
       nowIso,
-      buResolution.businessUnitId,
+      gate.businessUnitId,
       // NOT EXISTS subquery params
       body.staff_id,
       blockEndsAt.toISOString(),

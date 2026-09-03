@@ -1,18 +1,73 @@
-import { describe, expect, test, vi } from 'vitest';
+import { beforeEach, describe, expect, test, vi } from 'vitest';
 import { Hono } from 'hono';
+import type { GateReason, Reservability } from '@line-crm/db';
+
+interface AvailabilityByStaff {
+  staff_id: string;
+  display_name: string;
+  slots: { date: string; start: string; end: string }[];
+}
 
 const availabilityMocks = {
   computeSlots: vi.fn(() => [] as { start: string; end: string }[]),
-  getAvailability: vi.fn(async () => ({
-    by_staff: [{ staff_id: 's1', display_name: 'A', slots: [] }],
-  })),
+  getAvailability: vi.fn(
+    async (): Promise<{ by_staff: AvailabilityByStaff[] }> => ({
+      by_staff: [{ staff_id: 's1', display_name: 'A', slots: [] }],
+    }),
+  ),
 };
 vi.mock('../services/availability.js', () => availabilityMocks);
 
 const notifierMocks = { sendBookingNotification: vi.fn() };
 vi.mock('../services/booking-notifier.js', () => notifierMocks);
 
+// 予約可否の関門(gate)。既定は「通す」。
+// 🔑 gate の判定そのもの（接続0件は通す・scope が blocked なら閉じる 等）は
+//    packages/db/test/booking-gate.test.ts が本物のSQLiteで検証している。
+//    ここで検証するのは「ルートが gate を呼び、その答えに従うか」だけ。
+//    層を分けないと、SQL断片マッチのモックで gate の中身を再現することになり、
+//    何も検証していないテストになる。
+const gateMocks = {
+  getReservability: vi.fn(
+    async (): Promise<Reservability> => ({
+      reservable: true,
+      businessUnitId: 'bu_acc1',
+      coverageThrough: null,
+    }),
+  ),
+};
+vi.mock('@line-crm/db', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@line-crm/db')>();
+  return { ...actual, getReservability: gateMocks.getReservability };
+});
+
+/** gate が閉じる応答。reason だけ差し替えて使う。 */
+function blockedGate(reason: GateReason, over: Record<string, unknown> = {}): Reservability {
+  return {
+    reservable: false,
+    reason,
+    businessUnitId: 'bu_acc1',
+    blockedFrom: null,
+    lastSuccessfulSyncAt: null,
+    lastManualRunAt: null,
+    ...over,
+  };
+}
+
 const { default: booking } = await import('./booking.js');
+
+beforeEach(() => {
+  // 🔑 呼び出し回数まで主張するテストがあるので、履歴も毎回消す。
+  gateMocks.getReservability.mockClear();
+  gateMocks.getReservability.mockResolvedValue({
+    reservable: true,
+    businessUnitId: 'bu_acc1',
+    coverageThrough: null,
+  });
+  availabilityMocks.getAvailability.mockResolvedValue({
+    by_staff: [{ staff_id: 's1', display_name: 'A', slots: [] }],
+  });
+});
 
 function makeApp(db: unknown) {
   const app = new Hono();
@@ -82,6 +137,97 @@ describe('GET /api/booking/admin/availability', () => {
       env,
     );
     expect(res.status).toBe(400);
+  });
+
+  // 🔴 表示側の gate。ここを閉じないと、人が画面を見て手で予約を入れる。
+  //    確定側(POST)だけを閉じても穴は塞がらない。
+
+  test('🔴 A: gate が閉じたスタッフは枠を出さず、理由と最終同期時刻を返す', async () => {
+    availabilityMocks.getAvailability.mockResolvedValue({
+      by_staff: [{ staff_id: 's1', display_name: 'A', slots: [{ date: '2026-07-08', start: '11:00', end: '12:00' }] }],
+    });
+    gateMocks.getReservability.mockResolvedValue(
+      blockedGate('stale', {
+        lastSuccessfulSyncAt: '2026-09-01T10:00:00.000',
+        lastManualRunAt: '2026-09-03T18:00:00.000',
+      }),
+    );
+    const { app, env } = makeApp(emptyDb);
+    const res = await app.request(
+      '/api/booking/admin/availability?account_id=acc1&menu_id=m1&from=2026-07-08&to=2026-07-14',
+      {},
+      env,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      by_staff: { slots: unknown[] }[];
+      gate: { reservable: boolean; blocked_staff: { staff_id: string; reason: string; last_successful_sync_at: string; last_manual_run_at: string }[] };
+    };
+    // 枠は出さない
+    expect(body.by_staff[0].slots).toEqual([]);
+    // 🔑 ただし空欄で終わらせない。理由を載せる（空欄だと「空きが無い」と読まれる）
+    expect(body.gate.reservable).toBe(false);
+    expect(body.gate.blocked_staff[0]).toMatchObject({
+      staff_id: 's1',
+      reason: 'stale',
+      // 自動と手動は別フィールドのまま返す（表示で混ぜないため）
+      last_successful_sync_at: '2026-09-01T10:00:00.000',
+      last_manual_run_at: '2026-09-03T18:00:00.000',
+    });
+  });
+
+  test('🔴 A: coverage_through より後の日付の枠は出さない', async () => {
+    availabilityMocks.getAvailability.mockResolvedValue({
+      by_staff: [
+        {
+          staff_id: 's1',
+          display_name: 'A',
+          slots: [
+            { date: '2026-07-08', start: '11:00', end: '12:00' },
+            { date: '2026-07-10', start: '11:00', end: '12:00' },
+            { date: '2026-07-14', start: '11:00', end: '12:00' },
+          ],
+        },
+      ],
+    });
+    gateMocks.getReservability.mockResolvedValue({
+      reservable: true,
+      businessUnitId: 'bu_acc1',
+      coverageThrough: '2026-07-10',
+    });
+    const { app, env } = makeApp(emptyDb);
+    const res = await app.request(
+      '/api/booking/admin/availability?account_id=acc1&menu_id=m1&from=2026-07-08&to=2026-07-14',
+      {},
+      env,
+    );
+    const body = (await res.json()) as { by_staff: { slots: { date: string }[] }[]; gate: { coverage_through: string } };
+    expect(body.by_staff[0].slots.map((s) => s.date)).toEqual(['2026-07-08', '2026-07-10']);
+    expect(body.gate.coverage_through).toBe('2026-07-10');
+  });
+
+  test('🔴 B: gate をスタッフごとに呼んでいる（店舗単位で1回ではない）', async () => {
+    availabilityMocks.getAvailability.mockResolvedValue({
+      by_staff: [
+        { staff_id: 's1', display_name: 'A', slots: [] },
+        { staff_id: 's2', display_name: 'B', slots: [] },
+      ],
+    });
+    const { app, env } = makeApp(emptyDb);
+    await app.request(
+      '/api/booking/admin/availability?account_id=acc1&menu_id=m1&from=2026-07-08&to=2026-07-14',
+      {},
+      env,
+    );
+    // scope の粒度がスタッフ単位なので、店舗単位で1回だけ判定すると
+    // 「スタッフAだけ止まっている」時に全員分を閉じてしまう
+    expect(gateMocks.getReservability).toHaveBeenCalledTimes(2);
+    for (const staffId of ['s1', 's2']) {
+      expect(gateMocks.getReservability).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ lineAccountId: 'acc1', staffId, date: '2026-07-08' }),
+      );
+    }
   });
 });
 
@@ -241,55 +387,86 @@ describe('POST /api/booking/admin/bookings', () => {
   });
 
   // --------------------------------------------------------------
-  // business_unit の fail-closed（ガードが効く側）
+  // 🔴 gate（ガードが効く側）— ミューテーションテスト
   //
-  // 🔴 検証したいのはステータスコードではなく「予約が1件も作られないこと」。
-  //    INSERT のモックは changes:1 を返したままにしてあるので、ガードが効かなければ
-  //    201 になってこのテストが落ちる。
+  // 検証したいのはステータスコードではなく「予約が1件も作られないこと」。
+  // INSERT のモックは changes:1 を返したままにしてあるので、gate を無視すれば
+  // 201 になってこのテストが落ちる。
   //
-  // 📘 このガード自体のテストが無かったせいで、cdb3cfb 以降 3 件が赤いまま残り、
-  //    後から「元からの赤か、自分が増やした赤か」を判別できなくなった。
-  //    fail-closed のガードには、必ず「止まる側」のテストを付ける。
+  // A(挙動) と B(結線) を対で置く。A だけだと「gate を消して別の理由で 503 に
+  // なる」実装でも通ってしまうので、B で gate が実際に判断していることを固定する。
+  //
+  // 📘 fail-closed のガードには必ず「止まる側」のテストを付ける（2026-09-03 の決定）。
+  //    cdb3cfb がこれを付けなかったせいで3件が赤いまま残り、後から「元からの赤か、
+  //    自分が増やした赤か」を判別できなくなった。
 
-  test('🔴 503 when the account has no business_unit (予約を作らない)', async () => {
+  test('🔴 A: gate が閉じたら 503・予約を作らない（no_business_unit）', async () => {
     availabilityMocks.computeSlots.mockReturnValue([{ start: '11:00', end: '12:00' }]);
-    const db = happyDb(1, []); // 候補 0 件
+    gateMocks.getReservability.mockResolvedValue(blockedGate('no_business_unit'));
+    const db = happyDb();
     const { app, env } = makeApp(db);
     const res = await app.request(
       '/api/booking/admin/bookings?account_id=acc1',
-      {
-        method: 'POST',
-        body: JSON.stringify(validBody),
-        headers: { 'Content-Type': 'application/json' },
-      },
+      { method: 'POST', body: JSON.stringify(validBody), headers: { 'Content-Type': 'application/json' } },
       env,
       execCtx,
     );
     expect(res.status).toBe(503);
-    expect((await res.json() as { error: string }).error).toBe('booking_unavailable');
+    expect(await res.json()).toMatchObject({ error: 'booking_unavailable', reason: 'no_business_unit' });
     expect(db.calls.some((c) => c.sql.includes('INSERT INTO bookings'))).toBe(false);
   });
 
-  test('🔴 503 when the business_unit is ambiguous (先頭を選ばず、予約を作らない)', async () => {
+  test('🔴 A: gate が閉じたら 503・予約を作らない（stale＝同期が止まっている）', async () => {
     availabilityMocks.computeSlots.mockReturnValue([{ start: '11:00', end: '12:00' }]);
-    const db = happyDb(1, [{ id: 'bu_1' }, { id: 'bu_2' }]); // 候補 2 件
+    gateMocks.getReservability.mockResolvedValue(blockedGate('stale'));
+    const db = happyDb();
     const { app, env } = makeApp(db);
     const res = await app.request(
       '/api/booking/admin/bookings?account_id=acc1',
-      {
-        method: 'POST',
-        body: JSON.stringify(validBody),
-        headers: { 'Content-Type': 'application/json' },
-      },
+      { method: 'POST', body: JSON.stringify(validBody), headers: { 'Content-Type': 'application/json' } },
       env,
       execCtx,
     );
     expect(res.status).toBe(503);
-    expect((await res.json() as { error: string }).error).toBe('booking_unavailable');
-    // 🔴 「それらしい 1 件」(ORDER BY の先頭 = bu_1) を選んで予約を作らないこと。
-    //    誤った所属で登録されるとその店の枠が塞がり、本来の店の枠は開いたまま残る。
-    //    値が入っているので NULL 監視もすり抜ける。NULL より誤った値の方が危険。
+    expect(await res.json()).toMatchObject({ error: 'booking_unavailable', reason: 'stale' });
     expect(db.calls.some((c) => c.sql.includes('INSERT INTO bookings'))).toBe(false);
+  });
+
+  test('🔴 B: gate を、その予約のスタッフと日付で呼んでいる', async () => {
+    availabilityMocks.computeSlots.mockReturnValue([{ start: '11:00', end: '12:00' }]);
+    const { app, env } = makeApp(happyDb());
+    await app.request(
+      '/api/booking/admin/bookings?account_id=acc1',
+      { method: 'POST', body: JSON.stringify(validBody), headers: { 'Content-Type': 'application/json' } },
+      env,
+      execCtx,
+    );
+    const jstDate = new Date(new Date(futureStartsAt).getTime() + 9 * 3600_000)
+      .toISOString()
+      .slice(0, 10);
+    expect(gateMocks.getReservability).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ lineAccountId: 'acc1', staffId: 's1', date: jstDate }),
+    );
+  });
+
+  test('🔴 B: gate が返した business_unit で予約を作っている', async () => {
+    availabilityMocks.computeSlots.mockReturnValue([{ start: '11:00', end: '12:00' }]);
+    gateMocks.getReservability.mockResolvedValue({
+      reservable: true,
+      businessUnitId: 'bu_from_gate',
+      coverageThrough: null,
+    });
+    const db = happyDb();
+    const { app, env } = makeApp(db);
+    await app.request(
+      '/api/booking/admin/bookings?account_id=acc1',
+      { method: 'POST', body: JSON.stringify(validBody), headers: { 'Content-Type': 'application/json' } },
+      env,
+      execCtx,
+    );
+    const insert = db.calls.find((c) => c.sql.includes('INSERT INTO bookings'));
+    expect(insert?.params).toContain('bu_from_gate');
   });
 
   test('422 when slot not in availability', async () => {
