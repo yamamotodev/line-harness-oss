@@ -140,7 +140,9 @@ describe('POST /api/booking/admin/bookings', () => {
     starts_at: futureStartsAt, // JST 11:00
   };
 
-  function happyDb(insertChanges = 1) {
+  // businessUnits は resolveBusinessUnitId が見る候補。既定は「1件に決まる」。
+  // 0件 / 2件以上を渡すと fail-closed のガードが働く側を再現できる。
+  function happyDb(insertChanges = 1, businessUnits: unknown[] = [{ id: 'bu_acc1' }]) {
     return scriptedDb([
       ['FROM friends', { first: { id: 'f1', is_following: 1 } }],
       ['FROM staff WHERE', { first: { ok: 1 } }],
@@ -161,7 +163,7 @@ describe('POST /api/booking/admin/bookings', () => {
       // 予約は必ず business_unit に属する(migration 050)。ルートは書き込みの手前で
       // resolveBusinessUnitId を通し、決められなければ 503 で予約を作らない。
       // 🔴 この行が無いと候補0件 = no_business_unit となり、全部 503 になる。
-      ['FROM business_units', { all: { results: [{ id: 'bu_acc1' }] } }],
+      ['FROM business_units', { all: { results: businessUnits } }],
       ['INSERT INTO bookings', { run: { meta: { changes: insertChanges } } }],
     ]);
   }
@@ -236,6 +238,58 @@ describe('POST /api/booking/admin/bookings', () => {
       execCtx,
     );
     expect(res.status).toBe(409);
+  });
+
+  // --------------------------------------------------------------
+  // business_unit の fail-closed（ガードが効く側）
+  //
+  // 🔴 検証したいのはステータスコードではなく「予約が1件も作られないこと」。
+  //    INSERT のモックは changes:1 を返したままにしてあるので、ガードが効かなければ
+  //    201 になってこのテストが落ちる。
+  //
+  // 📘 このガード自体のテストが無かったせいで、cdb3cfb 以降 3 件が赤いまま残り、
+  //    後から「元からの赤か、自分が増やした赤か」を判別できなくなった。
+  //    fail-closed のガードには、必ず「止まる側」のテストを付ける。
+
+  test('🔴 503 when the account has no business_unit (予約を作らない)', async () => {
+    availabilityMocks.computeSlots.mockReturnValue([{ start: '11:00', end: '12:00' }]);
+    const db = happyDb(1, []); // 候補 0 件
+    const { app, env } = makeApp(db);
+    const res = await app.request(
+      '/api/booking/admin/bookings?account_id=acc1',
+      {
+        method: 'POST',
+        body: JSON.stringify(validBody),
+        headers: { 'Content-Type': 'application/json' },
+      },
+      env,
+      execCtx,
+    );
+    expect(res.status).toBe(503);
+    expect((await res.json() as { error: string }).error).toBe('booking_unavailable');
+    expect(db.calls.some((c) => c.sql.includes('INSERT INTO bookings'))).toBe(false);
+  });
+
+  test('🔴 503 when the business_unit is ambiguous (先頭を選ばず、予約を作らない)', async () => {
+    availabilityMocks.computeSlots.mockReturnValue([{ start: '11:00', end: '12:00' }]);
+    const db = happyDb(1, [{ id: 'bu_1' }, { id: 'bu_2' }]); // 候補 2 件
+    const { app, env } = makeApp(db);
+    const res = await app.request(
+      '/api/booking/admin/bookings?account_id=acc1',
+      {
+        method: 'POST',
+        body: JSON.stringify(validBody),
+        headers: { 'Content-Type': 'application/json' },
+      },
+      env,
+      execCtx,
+    );
+    expect(res.status).toBe(503);
+    expect((await res.json() as { error: string }).error).toBe('booking_unavailable');
+    // 🔴 「それらしい 1 件」(ORDER BY の先頭 = bu_1) を選んで予約を作らないこと。
+    //    誤った所属で登録されるとその店の枠が塞がり、本来の店の枠は開いたまま残る。
+    //    値が入っているので NULL 監視もすり抜ける。NULL より誤った値の方が危険。
+    expect(db.calls.some((c) => c.sql.includes('INSERT INTO bookings'))).toBe(false);
   });
 
   test('422 when slot not in availability', async () => {
