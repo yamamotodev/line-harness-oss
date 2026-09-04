@@ -184,6 +184,38 @@ export async function getAvailability(
     .bind(...staffIds, rangeEnd.toISOString(), rangeStart.toISOString())
     .all<{ staff_id: string; starts_at: string; block_ends_at: string }>();
 
+  // ----------------------------------------------------------------
+  // 設備(resource)条件。空きは「staff が空き かつ resource も空き」の AND。
+  //
+  // 🔑 このメニューが設備を使わない(＝美容室。menu_resources に1行も無い)なら、
+  //    ここから先のクエリは1本も走らず、busy も1件も増えない。挙動は設備を
+  //    入れる前と完全に同じになる。これは availability.golden.test.ts が
+  //    スナップショットで固定している。
+  // 🔴 設備の埋まりは「そのスタッフの予約」ではなく「その設備の予約」なので、
+  //    全スタッフの busy に足す。ベッドが1台しか無ければ、誰が担当でも塞がる。
+  const menuResources = await db
+    .prepare(`SELECT resource_id FROM menu_resources WHERE menu_id = ? AND line_account_id = ?`)
+    .bind(params.menuId, params.lineAccountId)
+    .all<{ resource_id: string }>();
+  const resourceIds = (menuResources.results ?? []).map((r) => r.resource_id);
+
+  let resourceBusy: { starts_at: string; block_ends_at: string }[] = [];
+  if (resourceIds.length > 0) {
+    const resourcePlaceholders = resourceIds.map(() => '?').join(',');
+    const rows = await db
+      .prepare(
+        `SELECT starts_at, block_ends_at
+           FROM bookings
+          WHERE resource_id IN (${resourcePlaceholders})
+            AND status IN ('requested','confirmed')
+            AND starts_at < ?
+            AND block_ends_at > ?`,
+      )
+      .bind(...resourceIds, rangeEnd.toISOString(), rangeStart.toISOString())
+      .all<{ starts_at: string; block_ends_at: string }>();
+    resourceBusy = rows.results ?? [];
+  }
+
   const menuForCalc = {
     duration_minutes: menu.override_duration ?? menu.duration_minutes,
     buffer_after_minutes: menu.buffer_after_minutes,
@@ -203,9 +235,16 @@ export async function getAvailability(
           start: jstHHMM(new Date(b.starts_at)),
           end: jstHHMM(new Date(b.block_ends_at)),
         }));
+      // 設備が使われていなければ resourceBusy は空なので、busy は今までと同じ。
+      const dayResourceBusy = resourceBusy
+        .filter((b) => jstDateStr(new Date(b.starts_at)) === date)
+        .map((b) => ({
+          start: jstHHMM(new Date(b.starts_at)),
+          end: jstHHMM(new Date(b.block_ends_at)),
+        }));
       const daySlots = computeSlots({
         working: [{ start: shift.start_time, end: shift.end_time }],
-        busy: dayBookings,
+        busy: dayResourceBusy.length ? [...dayBookings, ...dayResourceBusy] : dayBookings,
         menu: menuForCalc,
         granularityMinutes: SLOT_GRANULARITY_MINUTES,
       });
