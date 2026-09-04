@@ -9,6 +9,7 @@ export * from './users';
 export * from './line-accounts';
 export * from './business-units';
 export * from './booking-gate';
+export * from './booking-conflict';
 export * from './conversions';
 export * from './affiliates';
 export * from './webhooks';

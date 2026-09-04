@@ -11,7 +11,12 @@
 // scheduled_at / decided_at / expires_at) are written from the Worker.
 
 import { Hono, type Context } from 'hono';
-import { getLineAccounts, getReservability } from '@line-crm/db';
+import {
+  getLineAccounts,
+  getReservability,
+  BOOKING_CONFLICT_NOT_EXISTS,
+  bookingConflictParams,
+} from '@line-crm/db';
 import type { Env } from '../index.js';
 import { canTransition, nextStatus, type BookingAction } from '../services/booking-state.js';
 import { computeSlots, getAvailability } from '../services/availability.js';
@@ -488,13 +493,7 @@ booking.post('/api/liff/booking/requests', async (c) => {
          starts_at, ends_at, block_ends_at, status,
          customer_note, price_at_booking, requested_at, business_unit_id)
        SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?
-        WHERE NOT EXISTS (
-          SELECT 1 FROM bookings
-           WHERE staff_id = ?
-             AND status IN ('requested','confirmed')
-             AND starts_at < ?
-             AND block_ends_at > ?
-        )`,
+        WHERE ${BOOKING_CONFLICT_NOT_EXISTS}`,
     )
     .bind(
       bookingId,
@@ -511,9 +510,14 @@ booking.post('/api/liff/booking/requests', async (c) => {
       nowIso,
       gate.businessUnitId,
       // NOT EXISTS subquery params
-      body.staff_id,
-      blockEndsAt.toISOString(),
-      startsAt.toISOString(),
+      // 🔑 設備を使わないメニューでは resourceId = null となり、判定は
+      //    staff_id の overlap だけになる（設備を入れる前と同じ挙動）。
+      ...bookingConflictParams({
+        blockEndsAt: blockEndsAt.toISOString(),
+        startsAt: startsAt.toISOString(),
+        staffId: body.staff_id,
+        resourceId: null,
+      }),
     )
     .run();
   if ((insertResult.meta?.changes ?? 0) === 0) {
@@ -945,13 +949,7 @@ booking.post('/api/booking/admin/bookings', async (c) => {
          starts_at, ends_at, block_ends_at, status,
          customer_note, price_at_booking, requested_at, decided_at, business_unit_id)
        SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?
-        WHERE NOT EXISTS (
-          SELECT 1 FROM bookings
-           WHERE staff_id = ?
-             AND status IN ('requested','confirmed')
-             AND starts_at < ?
-             AND block_ends_at > ?
-        )`,
+        WHERE ${BOOKING_CONFLICT_NOT_EXISTS}`,
     )
     .bind(
       bookingId,
@@ -969,9 +967,14 @@ booking.post('/api/booking/admin/bookings', async (c) => {
       nowIso,
       gate.businessUnitId,
       // NOT EXISTS subquery params
-      body.staff_id,
-      blockEndsAt.toISOString(),
-      startsAt.toISOString(),
+      // 🔑 設備を使わないメニューでは resourceId = null となり、判定は
+      //    staff_id の overlap だけになる（設備を入れる前と同じ挙動）。
+      ...bookingConflictParams({
+        blockEndsAt: blockEndsAt.toISOString(),
+        startsAt: startsAt.toISOString(),
+        staffId: body.staff_id,
+        resourceId: null,
+      }),
     )
     .run();
   if ((insertResult.meta?.changes ?? 0) === 0) {
