@@ -93,40 +93,29 @@ export interface AvailabilityByStaff {
   slots: AvailabilitySlot[];
 }
 
+/**
+ * D1 を読まずに使える静的な既定値の型。
+ *
+ * 🔴 `booking_horizon_days`（何日先まで売るか）はここに無い。2026-09-23 に
+ *    定数 14 を廃止し、D1 の account_settings から読むようにした
+ *    (`./booking-horizon.ts` の `getBookingHorizonDays` / `resolveSalesHorizon`)。
+ *
+ *    廃止した理由: 14 は「LIFF の DateTimePicker が見せている範囲
+ *    (RANGE_DAYS = 14)」に合わせただけの値で、販売上限の実測ではなかった。
+ *    管理画面 (GET /api/booking/admin/availability) は1リクエスト28日の上限が
+ *    あるだけで先の日付を何度でも引けるため、14 は実際の販売範囲より狭い。
+ *    狭い上限を bootstrap の完了判定に使うと、同期は 365 日分やるのに
+ *    完了判定は 14 日分で ready と言い、15〜365 日目が「同期できていないのに
+ *    売られている」状態になる。(決定 = R20260923-0100)
+ */
 export interface AccountSettings {
   reminder_hours_before: number;
   min_lead_time_minutes: number;
-  /**
-   * 何日先まで予約を受け付けるか（販売上限）。
-   *
-   * 🔑 14 なのは、LIFF の DateTimePicker が実際に見せている範囲(RANGE_DAYS = 14)と
-   *    一致させたから(値を発明していない)。
-   *
-   * 🔴 危険なのは「実物より狭く書くこと」。狭いと販売上限が実際の販売範囲より
-   *    手前になり、まだ同期できていない日付を売ったまま bootstrap が完了扱いに
-   *    なる。広く書いた場合は bootstrap の完了条件が厳しくなるだけで安全側。
-   *    (2026-09-04 訂正: 初版のコメントはこの向きを逆に書いていた)
-   *
-   * 🔴 未解決: この 14 は LIFF の実測値でしかない。管理画面
-   *    (GET /api/booking/admin/availability) は1リクエスト28日の上限があるだけで
-   *    先の日付を何度でも引けるため、実質の販売上限は測れていない。
-   *    販売上限は「どの経路でも売れる最も先の日付」でなければならないので、
-   *    この定数を bootstrap の完了判定に使う Step 3 で確定させること。
-   *
-   * 使う側:
-   *   - bootstrap の完了判定 … coverage_through >= 販売上限 を満たして初めて
-   *     scope を ready にする(migration 051 / 指示書 §5-3)。
-   *     販売上限 = min(staff_shifts の最終日, booking_horizon_days)
-   *   - gate は「要求された日付が coverage_through 以内か」を日付単位で見るので、
-   *     この定数には依存しない。
-   */
-  booking_horizon_days: number;
 }
 
 export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   reminder_hours_before: 2,
   min_lead_time_minutes: 60,
-  booking_horizon_days: 14,
 };
 
 export const SLOT_GRANULARITY_MINUTES = 30;
